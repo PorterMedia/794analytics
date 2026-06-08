@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 794 Analytics
  * Description: Tracks page views, unique page views, link clicks, unique clicks, CTR, UTM data, referrers, campaigns, internal-link destinations, and tour-date/event link locations inside the WordPress admin. Replaces the WP home dashboard with an immersive analytics overview. Includes CSV and PDF report export.
- * Version: 4.1.0
+ * Version: 4.2.0
  * Author: Porter Media
  * Update URI: https://github.com/PorterMedia/794analytics
  */
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 
 class Backlot_Click_Tracker {
 
-    const DB_VERSION = '3.6.0';
+    const DB_VERSION = '3.7.0';
 
     private static $instance = null;
     private $table_name;
@@ -89,6 +89,7 @@ class Backlot_Click_Tracker {
             'retention_months'   => 12,
             'exclude_admins'     => 1,
             'dashboard_takeover' => 1,
+            'geo_lookup'         => 1,
         );
 
         $saved = get_option('backlot_ct_settings', array());
@@ -120,6 +121,7 @@ class Backlot_Click_Tracker {
             'retention_months'   => $months,
             'exclude_admins'     => empty($input['exclude_admins']) ? 0 : 1,
             'dashboard_takeover' => empty($input['dashboard_takeover']) ? 0 : 1,
+            'geo_lookup'         => empty($input['geo_lookup']) ? 0 : 1,
         );
     }
 
@@ -166,6 +168,16 @@ class Backlot_Click_Tracker {
                             <p class="description">Turn off to leave the standard WordPress dashboard in place.</p>
                         </td>
                     </tr>
+                    <tr>
+                        <th scope="row">Visitor country</th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="backlot_ct_settings[geo_lookup]" value="1" <?php checked($s['geo_lookup'], 1); ?>>
+                                Look up each visitor&rsquo;s country
+                            </label>
+                            <p class="description">Uses your CDN&rsquo;s country header when available, otherwise a free lookup (cached per visitor for a day). Powers the Top Countries report. Only the 2-letter country code is stored &mdash; never the IP.</p>
+                        </td>
+                    </tr>
                 </table>
                 <?php submit_button('Save settings'); ?>
             </form>
@@ -181,6 +193,110 @@ class Backlot_Click_Tracker {
         }
 
         return false;
+    }
+
+    /* ===== Geography ===== */
+
+    /**
+     * Resolve a visitor's country (ISO 3166-1 alpha-2). Prefers CDN/proxy headers
+     * (free, instant) and falls back to a keyless API, cached per IP for a day so
+     * we make at most one lookup per visitor per day. Returns '' when unknown.
+     */
+    private function get_country($ip) {
+        $header_keys = array(
+            'HTTP_CF_IPCOUNTRY',                // Cloudflare
+            'HTTP_CLOUDFRONT_VIEWER_COUNTRY',   // AWS CloudFront
+            'HTTP_X_GEO_COUNTRY',
+            'HTTP_X_COUNTRY_CODE',
+        );
+
+        foreach ($header_keys as $hk) {
+            if (!empty($_SERVER[$hk])) {
+                $code = strtoupper(substr(sanitize_text_field(wp_unslash($_SERVER[$hk])), 0, 2));
+                if (ctype_alpha($code) && $code !== 'XX' && $code !== 'T1') {
+                    return $code;
+                }
+            }
+        }
+
+        if (!$ip) {
+            return '';
+        }
+
+        $s = $this->get_settings();
+        if (empty($s['geo_lookup'])) {
+            return '';
+        }
+
+        $key = 'backlot_geo_' . md5($ip);
+        $cached = get_transient($key);
+        if ($cached !== false) {
+            return ($cached === 'none') ? '' : $cached;
+        }
+
+        $code = '';
+        $response = wp_remote_get('https://api.country.is/' . rawurlencode($ip), array('timeout' => 3));
+        if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+            $body = json_decode(wp_remote_retrieve_body($response), true);
+            if (!empty($body['country']) && ctype_alpha($body['country'])) {
+                $code = strtoupper(substr($body['country'], 0, 2));
+            }
+        }
+
+        set_transient($key, ($code === '') ? 'none' : $code, DAY_IN_SECONDS);
+
+        return $code;
+    }
+
+    private function country_flag($code) {
+        $code = strtoupper((string) $code);
+        if (strlen($code) !== 2 || !ctype_alpha($code)) {
+            return '';
+        }
+
+        return $this->cp_to_utf8(0x1F1E6 + (ord($code[0]) - 65))
+             . $this->cp_to_utf8(0x1F1E6 + (ord($code[1]) - 65));
+    }
+
+    private function cp_to_utf8($cp) {
+        if ($cp <= 0x7F) {
+            return chr($cp);
+        }
+        if ($cp <= 0x7FF) {
+            return chr(0xC0 | ($cp >> 6)) . chr(0x80 | ($cp & 0x3F));
+        }
+        if ($cp <= 0xFFFF) {
+            return chr(0xE0 | ($cp >> 12)) . chr(0x80 | (($cp >> 6) & 0x3F)) . chr(0x80 | ($cp & 0x3F));
+        }
+        return chr(0xF0 | ($cp >> 18)) . chr(0x80 | (($cp >> 12) & 0x3F)) . chr(0x80 | (($cp >> 6) & 0x3F)) . chr(0x80 | ($cp & 0x3F));
+    }
+
+    private function country_name($code) {
+        $code = strtoupper((string) $code);
+
+        $names = array(
+            'US' => 'United States', 'CA' => 'Canada', 'GB' => 'United Kingdom', 'IE' => 'Ireland',
+            'AU' => 'Australia', 'NZ' => 'New Zealand', 'DE' => 'Germany', 'FR' => 'France',
+            'NL' => 'Netherlands', 'BE' => 'Belgium', 'LU' => 'Luxembourg', 'ES' => 'Spain',
+            'PT' => 'Portugal', 'IT' => 'Italy', 'CH' => 'Switzerland', 'AT' => 'Austria',
+            'SE' => 'Sweden', 'NO' => 'Norway', 'DK' => 'Denmark', 'FI' => 'Finland',
+            'IS' => 'Iceland', 'PL' => 'Poland', 'CZ' => 'Czechia', 'SK' => 'Slovakia',
+            'HU' => 'Hungary', 'RO' => 'Romania', 'BG' => 'Bulgaria', 'GR' => 'Greece',
+            'HR' => 'Croatia', 'SI' => 'Slovenia', 'RS' => 'Serbia', 'UA' => 'Ukraine',
+            'RU' => 'Russia', 'EE' => 'Estonia', 'LV' => 'Latvia', 'LT' => 'Lithuania',
+            'TR' => 'Turkey', 'IL' => 'Israel', 'AE' => 'United Arab Emirates', 'SA' => 'Saudi Arabia',
+            'MX' => 'Mexico', 'BR' => 'Brazil', 'AR' => 'Argentina', 'CL' => 'Chile',
+            'CO' => 'Colombia', 'PE' => 'Peru', 'UY' => 'Uruguay', 'EC' => 'Ecuador',
+            'VE' => 'Venezuela', 'CR' => 'Costa Rica', 'PA' => 'Panama', 'DO' => 'Dominican Republic',
+            'PR' => 'Puerto Rico', 'GT' => 'Guatemala', 'JP' => 'Japan', 'KR' => 'South Korea',
+            'CN' => 'China', 'HK' => 'Hong Kong', 'TW' => 'Taiwan', 'SG' => 'Singapore',
+            'MY' => 'Malaysia', 'TH' => 'Thailand', 'ID' => 'Indonesia', 'PH' => 'Philippines',
+            'VN' => 'Vietnam', 'IN' => 'India', 'PK' => 'Pakistan', 'BD' => 'Bangladesh',
+            'ZA' => 'South Africa', 'NG' => 'Nigeria', 'KE' => 'Kenya', 'GH' => 'Ghana',
+            'EG' => 'Egypt', 'MA' => 'Morocco', 'TN' => 'Tunisia',
+        );
+
+        return isset($names[$code]) ? $names[$code] : $code;
     }
 
     /* ===== Data retention (scheduled pruning) ===== */
@@ -245,6 +361,7 @@ class Backlot_Click_Tracker {
             link_classes TEXT NULL,
             link_category VARCHAR(100) NULL,
             event_location VARCHAR(255) NULL,
+            country VARCHAR(2) NULL,
             user_id BIGINT(20) UNSIGNED NULL,
             ip_hash VARCHAR(64) NULL,
             session_id VARCHAR(100) NULL,
@@ -263,7 +380,8 @@ class Backlot_Click_Tracker {
             KEY user_id (user_id),
             KEY ip_hash (ip_hash),
             KEY session_id (session_id),
-            KEY link_category (link_category)
+            KEY link_category (link_category),
+            KEY country (country)
         ) {$charset_collate};";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
@@ -303,6 +421,15 @@ class Backlot_Click_Tracker {
             if (!$has_event_location) {
                 // Appended at the end so MySQL can use an instant/in-place add.
                 $wpdb->query("ALTER TABLE {$this->table_name} ADD COLUMN event_location VARCHAR(255) NULL");
+            }
+
+            $has_country = $wpdb->get_var(
+                $wpdb->prepare("SHOW COLUMNS FROM {$this->table_name} LIKE %s", 'country')
+            );
+
+            if (!$has_country) {
+                $wpdb->query("ALTER TABLE {$this->table_name} ADD COLUMN country VARCHAR(2) NULL");
+                $wpdb->query("ALTER TABLE {$this->table_name} ADD KEY country (country)");
             }
         }
 
@@ -624,6 +751,7 @@ JS;
         $session_id = isset($_POST['session_id']) ? sanitize_text_field(wp_unslash($_POST['session_id'])) : '';
         $ip_address = $this->get_ip_address();
         $ip_hash = $ip_address ? hash('sha256', $ip_address . wp_salt('auth')) : '';
+        $country = $this->get_country($ip_address);
 
         $existing = $wpdb->get_var(
             $wpdb->prepare(
@@ -654,6 +782,7 @@ JS;
                 'page_url'     => $page_url,
                 'user_id'      => get_current_user_id(),
                 'ip_hash'      => $ip_hash,
+                'country'      => $country,
                 'session_id'   => $session_id,
                 'user_agent'   => isset($_SERVER['HTTP_USER_AGENT']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_USER_AGENT'])) : '',
                 'referrer'     => isset($_POST['referrer']) ? esc_url_raw(wp_unslash($_POST['referrer'])) : '',
@@ -686,6 +815,7 @@ JS;
         $now = current_time('mysql');
         $ip_address = $this->get_ip_address();
         $ip_hash = $ip_address ? hash('sha256', $ip_address . wp_salt('auth')) : '';
+        $country = $this->get_country($ip_address);
 
         $wpdb->insert(
             $this->table_name,
@@ -704,6 +834,7 @@ JS;
                 'event_location' => isset($_POST['event_location']) ? sanitize_text_field(wp_unslash($_POST['event_location'])) : '',
                 'user_id'       => get_current_user_id(),
                 'ip_hash'       => $ip_hash,
+                'country'       => $country,
                 'session_id'    => isset($_POST['session_id']) ? sanitize_text_field(wp_unslash($_POST['session_id'])) : '',
                 'user_agent'    => isset($_SERVER['HTTP_USER_AGENT']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_USER_AGENT'])) : '',
                 'referrer'      => isset($_POST['referrer']) ? esc_url_raw(wp_unslash($_POST['referrer'])) : '',
@@ -1400,6 +1531,24 @@ CSS;
             )
         );
 
+        $country_rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT
+                    country,
+                    SUM(CASE WHEN event_type = 'pageview' THEN 1 ELSE 0 END) AS pageviews,
+                    COUNT(DISTINCT CASE WHEN event_type = 'pageview' THEN session_id END) AS unique_pageviews
+                 FROM {$this->table_name}
+                 {$where}
+                 AND country IS NOT NULL
+                 AND country <> ''
+                 GROUP BY country
+                 HAVING pageviews > 0
+                 ORDER BY pageviews DESC
+                 LIMIT 10",
+                $params
+            )
+        );
+
         $daily_rows = $wpdb->get_results(
             $wpdb->prepare(
                 "SELECT
@@ -1463,6 +1612,7 @@ CSS;
             ),
             'top_links' => $top_links,
             'top_pages' => $top_pages,
+            'top_countries' => $country_rows,
             'charts' => array(
                 'labels' => $labels,
                 'pageviews' => $series_pageviews,
@@ -1579,6 +1729,29 @@ CSS;
                 <h3>Top Links by Clicks</h3>
                 <div class="backlot-canvas-holder backlot-canvas-tall"><canvas id="backlotLinksChart"></canvas></div>
             </div>
+
+            <?php if (!empty($data['top_countries'])) : ?>
+            <div class="backlot-chart-card" style="margin-bottom:18px;">
+                <h3>Top Countries</h3>
+                <ol class="backlot-rank">
+                    <?php $i = 1; foreach ($data['top_countries'] as $row) :
+                        $flag = $this->country_flag($row->country);
+                        ?>
+                        <li>
+                            <span class="rank-num"><?php echo esc_html($i++); ?></span>
+                            <span class="rank-body">
+                                <span class="rank-title"><?php echo ($flag ? $flag . ' ' : '') . esc_html($this->country_name($row->country)); ?></span>
+                                <span class="rank-sub"><?php echo esc_html($row->country); ?></span>
+                            </span>
+                            <span class="rank-metric">
+                                <strong><?php echo esc_html(number_format_i18n($row->pageviews)); ?></strong>
+                                <span><?php echo esc_html(number_format_i18n($row->unique_pageviews)); ?> uniq</span>
+                            </span>
+                        </li>
+                    <?php endforeach; ?>
+                </ol>
+            </div>
+            <?php endif; ?>
 
             <div class="backlot-dash-cols">
                 <div class="backlot-chart-card">
@@ -2550,6 +2723,7 @@ JS;
                     link_url,
                     link_target,
                     event_location,
+                    country,
                     session_id,
                     utm_source,
                     utm_medium,
@@ -2585,6 +2759,7 @@ JS;
             'Link URL',
             'Target',
             'Event Location',
+            'Country',
             'Session ID',
             'UTM Source',
             'UTM Medium',
