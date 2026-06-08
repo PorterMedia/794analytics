@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 794 Analytics
  * Description: Tracks page views, unique page views, link clicks, unique clicks, CTR, UTM data, referrers, campaigns, internal-link destinations, and tour-date/event link locations inside the WordPress admin. Replaces the WP home dashboard with an immersive analytics overview. Includes CSV and PDF report export.
- * Version: 4.2.0
+ * Version: 4.3.0
  * Author: Porter Media
  * Update URI: https://github.com/PorterMedia/794analytics
  */
@@ -516,6 +516,25 @@ class Backlot_Click_Tracker {
         return sessionId;
     }
 
+    function isNavLink(anchor) {
+        if (!anchor || !anchor.closest) {
+            return false;
+        }
+
+        var optIn = anchor.getAttribute('data-blm-nav');
+        if (optIn === 'true') {
+            return true;
+        }
+        if (optIn === 'false') {
+            return false;
+        }
+
+        return !!anchor.closest(
+            'nav, [role="navigation"], .wp-block-navigation, .menu, .menu-item, ' +
+            '.nav-menu, .navbar, .navigation, .main-navigation, .primary-menu, .footer-menu'
+        );
+    }
+
     function detectCategory(anchor) {
         var href = (anchor.href || '').toLowerCase();
         var classes = (anchor.className || '').toLowerCase();
@@ -578,7 +597,7 @@ class Backlot_Click_Tracker {
         }
 
         if (href.indexOf(window.location.hostname) !== -1) {
-            return 'Internal Link';
+            return isNavLink(anchor) ? 'Navigation' : 'Internal Link';
         }
 
         return 'External Link';
