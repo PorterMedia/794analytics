@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 794 Analytics
  * Description: Tracks page views, unique page views, link clicks, unique clicks, CTR, UTM data, referrers, campaigns, internal-link destinations, and tour-date/event link locations inside the WordPress admin. Replaces the WP home dashboard with an immersive analytics overview. Includes CSV and PDF report export.
- * Version: 4.0.1
+ * Version: 4.1.0
  * Author: Porter Media
  * Update URI: https://github.com/PorterMedia/794analytics
  */
@@ -56,6 +56,11 @@ class Backlot_Click_Tracker {
         add_action('admin_post_backlot_export_clicks_csv', array($this, 'export_csv'));
         add_action('admin_post_backlot_backfill_locations', array($this, 'backfill_locations'));
 
+        add_action('admin_init', array($this, 'register_settings'));
+        add_action('init', array($this, 'maybe_schedule_cron'));
+        add_action('backlot_prune_events', array($this, 'prune_old_events'));
+        register_deactivation_hook(__FILE__, array($this, 'deactivate'));
+
         // Self-hosted auto-updates from GitHub releases.
         $this->init_github_updater();
     }
@@ -75,6 +80,150 @@ class Backlot_Click_Tracker {
         }
 
         new Backlot_GitHub_Updater(__FILE__, $owner, $repo, $token);
+    }
+
+    /* ===== Settings ===== */
+
+    private function get_settings() {
+        $defaults = array(
+            'retention_months'   => 12,
+            'exclude_admins'     => 1,
+            'dashboard_takeover' => 1,
+        );
+
+        $saved = get_option('backlot_ct_settings', array());
+        if (!is_array($saved)) {
+            $saved = array();
+        }
+
+        return array_merge($defaults, $saved);
+    }
+
+    public function register_settings() {
+        register_setting(
+            'backlot_ct_settings_group',
+            'backlot_ct_settings',
+            array($this, 'sanitize_settings')
+        );
+    }
+
+    public function sanitize_settings($input) {
+        $months = isset($input['retention_months']) ? (int) $input['retention_months'] : 12;
+        if ($months < 0) {
+            $months = 0;
+        }
+        if ($months > 120) {
+            $months = 120;
+        }
+
+        return array(
+            'retention_months'   => $months,
+            'exclude_admins'     => empty($input['exclude_admins']) ? 0 : 1,
+            'dashboard_takeover' => empty($input['dashboard_takeover']) ? 0 : 1,
+        );
+    }
+
+    public function settings_page() {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        $s = $this->get_settings();
+        ?>
+        <div class="wrap backlot-admin-report-wrap">
+            <h1>794 Analytics &mdash; Settings</h1>
+            <form method="post" action="options.php" class="backlot-filter-panel" style="max-width:760px;">
+                <?php settings_fields('backlot_ct_settings_group'); ?>
+                <table class="form-table" role="presentation">
+                    <tr>
+                        <th scope="row">Data retention</th>
+                        <td>
+                            <label>
+                                Delete raw events older than
+                                <input type="number" min="0" max="120" name="backlot_ct_settings[retention_months]" value="<?php echo esc_attr($s['retention_months']); ?>" style="width:80px;">
+                                months
+                            </label>
+                            <p class="description">Runs once a day in the background. Set to <strong>0</strong> to keep all data forever.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Exclude admins</th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="backlot_ct_settings[exclude_admins]" value="1" <?php checked($s['exclude_admins'], 1); ?>>
+                                Don&rsquo;t record visits or clicks from logged-in administrators
+                            </label>
+                            <p class="description">Keeps your own browsing from inflating the numbers.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Home dashboard</th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="backlot_ct_settings[dashboard_takeover]" value="1" <?php checked($s['dashboard_takeover'], 1); ?>>
+                                Replace the WordPress home dashboard with the analytics overview
+                            </label>
+                            <p class="description">Turn off to leave the standard WordPress dashboard in place.</p>
+                        </td>
+                    </tr>
+                </table>
+                <?php submit_button('Save settings'); ?>
+            </form>
+        </div>
+        <?php
+    }
+
+    private function should_skip_tracking() {
+        $s = $this->get_settings();
+
+        if (!empty($s['exclude_admins']) && is_user_logged_in() && current_user_can('manage_options')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /* ===== Data retention (scheduled pruning) ===== */
+
+    public function maybe_schedule_cron() {
+        if (!wp_next_scheduled('backlot_prune_events')) {
+            wp_schedule_event(time() + HOUR_IN_SECONDS, 'daily', 'backlot_prune_events');
+        }
+    }
+
+    public function deactivate() {
+        $timestamp = wp_next_scheduled('backlot_prune_events');
+        if ($timestamp) {
+            wp_unschedule_event($timestamp, 'backlot_prune_events');
+        }
+    }
+
+    public function prune_old_events() {
+        $s = $this->get_settings();
+        $months = (int) $s['retention_months'];
+
+        if ($months <= 0) {
+            return;
+        }
+
+        global $wpdb;
+
+        // Delete in capped batches so a first prune on a large table never holds
+        // a long lock or times out the cron run.
+        for ($i = 0; $i < 20; $i++) {
+            $deleted = $wpdb->query(
+                $wpdb->prepare(
+                    "DELETE FROM {$this->table_name}
+                     WHERE viewed_at < DATE_SUB(NOW(), INTERVAL %d MONTH)
+                     LIMIT 5000",
+                    $months
+                )
+            );
+
+            if (!$deleted) {
+                break;
+            }
+        }
     }
 
     public function activate() {
@@ -121,6 +270,10 @@ class Backlot_Click_Tracker {
         dbDelta($sql);
 
         $this->migrate_old_click_data();
+
+        if (!wp_next_scheduled('backlot_prune_events')) {
+            wp_schedule_event(time() + HOUR_IN_SECONDS, 'daily', 'backlot_prune_events');
+        }
 
         update_option('backlot_ct_db_version', self::DB_VERSION);
     }
@@ -454,6 +607,10 @@ JS;
             wp_die();
         }
 
+        if ($this->should_skip_tracking()) {
+            wp_die();
+        }
+
         global $wpdb;
 
         $now = current_time('mysql');
@@ -520,6 +677,10 @@ JS;
             wp_die();
         }
 
+        if ($this->should_skip_tracking()) {
+            wp_die();
+        }
+
         global $wpdb;
 
         $now = current_time('mysql');
@@ -580,9 +741,36 @@ JS;
             'semrush',
             'ahrefs',
             'mj12',
+            'python',
             'python-requests',
             'curl',
-            'wget'
+            'wget',
+            'headless',
+            'phantom',
+            'puppeteer',
+            'playwright',
+            'scrapy',
+            'axios',
+            'go-http-client',
+            'okhttp',
+            'java/',
+            'libwww',
+            'httrack',
+            'node-fetch',
+            'dataprovider',
+            'siteimprove',
+            'screaming frog',
+            'yandex',
+            'baidu',
+            'bytespider',
+            'heritrix',
+            'ia_archiver',
+            'feedfetcher',
+            'embedly',
+            'archive.org',
+            'masscan',
+            'zgrab',
+            'censys'
         );
 
         foreach ($bots as $bot) {
@@ -1007,7 +1195,8 @@ CSS;
         wp_add_inline_style('backlot-click-tracker-admin', $css);
 
         // Charts only on the home dashboard (index.php), where we replace the widgets.
-        if ($hook === 'index.php' && current_user_can('manage_options')) {
+        $dash_settings = $this->get_settings();
+        if ($hook === 'index.php' && current_user_can('manage_options') && !empty($dash_settings['dashboard_takeover'])) {
             wp_enqueue_script(
                 'backlot-chartjs',
                 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js',
@@ -1059,10 +1248,24 @@ CSS;
             'dashicons-chart-area',
             58
         );
+
+        add_submenu_page(
+            'backlot-click-tracker',
+            '794 Analytics Settings',
+            'Settings',
+            'manage_options',
+            'backlot-ct-settings',
+            array($this, 'settings_page')
+        );
     }
 
     public function setup_dashboard() {
         if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        $settings = $this->get_settings();
+        if (empty($settings['dashboard_takeover'])) {
             return;
         }
 
@@ -1126,6 +1329,15 @@ CSS;
         global $wpdb;
 
         list($date_from, $date_to) = $this->get_dashboard_range();
+
+        // Short-lived cache so repeated dashboard loads don't re-run the
+        // aggregate queries every time. Keyed by range + schema version.
+        $cache_key = 'backlot_dash_' . md5($date_from . '|' . $date_to . '|' . self::DB_VERSION);
+        $cached = get_transient($cache_key);
+        if (is_array($cached)) {
+            $this->dashboard_data = $cached;
+            return $cached;
+        }
 
         $range_start = $date_from . ' 00:00:00';
         $range_end = $date_to . ' 23:59:59';
@@ -1266,6 +1478,8 @@ CSS;
                 ),
             ),
         );
+
+        set_transient($cache_key, $this->dashboard_data, 5 * MINUTE_IN_SECONDS);
 
         return $this->dashboard_data;
     }
