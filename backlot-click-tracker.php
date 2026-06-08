@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 794 Analytics
  * Description: Tracks page views, unique page views, link clicks, unique clicks, CTR, UTM data, referrers, campaigns, internal-link destinations, and tour-date/event link locations inside the WordPress admin. Replaces the WP home dashboard with an immersive analytics overview. Includes CSV and PDF report export.
- * Version: 4.3.0
+ * Version: 4.4.0
  * Author: Porter Media
  * Update URI: https://github.com/PorterMedia/794analytics
  */
@@ -2062,7 +2062,7 @@ JS;
         $section_expr = "CASE WHEN TRIM(LEADING '/' FROM {$path_expr}) = '' THEN '(home)' ELSE SUBSTRING_INDEX(TRIM(LEADING '/' FROM {$path_expr}), '/', 1) END";
         $host_expr    = "TRIM(LEADING 'www.' FROM LOWER(SUBSTRING_INDEX({$after_scheme}, '/', 1)))";
 
-        $internal_clause = " AND event_type = 'click' AND {$host_expr} = %s";
+        $internal_clause = " AND event_type = 'click' AND {$host_expr} = %s AND (link_category IS NULL OR link_category <> 'Navigation')";
         $internal_params = array_merge($params, array($site_host));
 
         $internal_sections = $wpdb->get_results(
@@ -2096,6 +2096,24 @@ JS;
                  ORDER BY clicks DESC
                  LIMIT 500",
                 $internal_params
+            )
+        );
+
+        $nav_items = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT
+                    MAX(link_text) AS link_text,
+                    link_url,
+                    COUNT(*) AS clicks,
+                    COUNT(DISTINCT session_id) AS unique_clicks
+                 FROM {$this->table_name}
+                 {$where}
+                 AND event_type = 'click'
+                 AND link_category = 'Navigation'
+                 GROUP BY link_url
+                 ORDER BY clicks DESC
+                 LIMIT 100",
+                $params
             )
         );
 
@@ -2202,6 +2220,14 @@ JS;
                     'unique'  => (int) $row->unique_clicks,
                 );
             }, $internal_paths),
+            'nav_items' => array_map(function ($row) {
+                return array(
+                    'text'   => $row->link_text ?: '',
+                    'url'    => $row->link_url,
+                    'clicks' => (int) $row->clicks,
+                    'unique' => (int) $row->unique_clicks,
+                );
+            }, $nav_items),
             'tour_dates' => array_map(function ($row) {
                 return array(
                     'event'  => $row->event_location,
@@ -2397,8 +2423,40 @@ JS;
             </div>
 
             <div class="backlot-report-section">
+                <h2>Navigation Menu</h2>
+                <p style="margin:4px 0 0;color:#646970;">Clicks on links inside your site navigation and menus, kept separate from in-content links.</p>
+
+                <table class="widefat striped">
+                    <thead>
+                        <tr>
+                            <th>Menu Item</th>
+                            <th>Destination</th>
+                            <th>Clicks</th>
+                            <th>Unique Clicks</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (!empty($nav_items)) : ?>
+                            <?php foreach ($nav_items as $n) : ?>
+                                <tr>
+                                    <td><strong><?php echo esc_html($n->link_text ?: '—'); ?></strong></td>
+                                    <td class="backlot-link-url">
+                                        <a href="<?php echo esc_url($n->link_url); ?>" target="_blank"><?php echo esc_html($n->link_url); ?></a>
+                                    </td>
+                                    <td><strong><?php echo esc_html(number_format_i18n($n->clicks)); ?></strong></td>
+                                    <td><?php echo esc_html(number_format_i18n($n->unique_clicks)); ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php else : ?>
+                            <tr><td colspan="4">No navigation clicks recorded yet. Navigation is tracked as its own category starting in v4.3.0, so this fills in with new traffic.</td></tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="backlot-report-section">
                 <h2>Internal Links</h2>
-                <p style="margin:4px 0 0;color:#646970;">Same-site link clicks grouped by destination section. Expand a section to drill into individual destinations.</p>
+                <p style="margin:4px 0 0;color:#646970;">In-content same-site link clicks grouped by destination section (navigation menu clicks appear in their own table above). Expand a section to drill into individual destinations.</p>
 
                 <table class="widefat striped">
                     <thead>
@@ -2987,6 +3045,14 @@ JS;
                 (R.categories || []).map(function (c) {
                     return [c.category, fmt(c.clicks), fmt(c.unique)];
                 })
+            );
+
+            section('Navigation Menu',
+                ['Menu Item', 'Destination', 'Clicks', 'Uniq'],
+                (R.nav_items || []).map(function (n) {
+                    return [n.text, n.url, fmt(n.clicks), fmt(n.unique)];
+                }),
+                { 1: { cellWidth: 160 } }
             );
 
             section('Internal Links by Section',
